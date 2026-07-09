@@ -1,6 +1,6 @@
 # Conversational Analytics API (GDA) Integration Guide
 
-This guide walkthroughs two approaches for interacting with BigQuery data using the Gemini Data Analytics (`geminidataanalytics_v1alpha`) API: **Stateless Chat** and **Persistent Agent Chat**.
+This guide walkthroughs three approaches for interacting with BigQuery data using the Gemini Data Analytics (`geminidataanalytics_v1alpha`) API: **Stateless Chat**, **Persistent Agent Chat**, and **A2A streaming** (the only path that exposes the *verified/example-query matched* signal).
 
 ---
 
@@ -48,6 +48,9 @@ python3 test_caapi_bq_chat.py
 
 # Execute Persistent Agent Chat (Saved Context)
 python3 test_caapi_bq_agent.py
+
+# Execute A2A streaming (captures the "verified query matched" signal)
+python3 test_caapi_bq_a2a.py
 ```
 
 ---
@@ -64,6 +67,19 @@ In the persistent approach, you create a named **Data Agent** on the server. The
 
 *   **Best for**: Production portals, repeatable workflows, fixed database schemas.
 *   **Drawback**: Requires a setup step to create the agent.
+
+### 3. A2A Streaming (`test_caapi_bq_a2a.py`)
+Both approaches above call `DataChatServiceClient.chat()`. That native stream does **not** surface a structured "this answer reused one of your authored `example_queries`" signal — when a question matches a verified query, the only trace is inside the model's free-text *THOUGHT* ("…Example Query 3… it's a direct hit…"). There is no typed field to key off.
+
+The **A2A streaming endpoint** (`.../v1/message:stream`) is the only path that emits the match as structured data, via `metadata.gda_message.subType`:
+
+*   `matched_query_question` — the verified query's natural-language question
+*   `matched_query_sql` — the verified query's authored SQL
+
+These are exactly what the BigQuery Conversational Analytics **UI renders as the "verified" checkmark**.
+
+*   **Best for**: Programmatically detecting when an answer was backed by a verified/example query (governance, audit, "trusted answer" badges).
+*   **Drawback**: Raw HTTP (no typed SDK client); you parse A2A envelopes yourself. Requires the agent to actually carry at least one `example_query`.
 
 ---
 
@@ -141,6 +157,52 @@ The `test_caapi_bq_agent.py` script showcases a third section: **Fully Stateful 
 
 > [!TIP]
 > Enabling `cloudaicompanion.googleapis.com` also unlocks the **Gemini for Google Cloud Console UI**, allowing you to chat with your BigQuery Data Agents directly through the Google Cloud Web Console! If you want a GUI for internal users, this is the API to enable.
+
+---
+
+### 🔗 A2A Streaming (`test_caapi_bq_a2a.py`)
+
+This script attaches a **verified query** to the agent, then talks to it over the **A2A `message:stream`** endpoint (raw HTTP, ADC bearer token) so it can read the match signal that the native `chat()` SDK never exposes.
+
+#### 1. Give the agent something to match (an authored `example_query`):
+```python
+context.example_queries = [
+    geminidataanalytics.ExampleQuery(
+        natural_language_question="Which species of tree is most prevalent?",
+        sql_query="SELECT species, COUNT(*) AS tree_count FROM ... GROUP BY species ORDER BY tree_count DESC",
+    )
+]
+```
+Without at least one `example_query`, there is nothing to match and the signal never fires.
+
+#### 2. Discover the stream URL from the agent's public AgentCard, then POST the question:
+```python
+card_url = (f"https://geminidataanalytics.googleapis.com/v1beta/a2a/"
+            f"projects/{project}/locations/{location}/dataAgents/{agent_id}/v1/card")
+stream_url = requests.get(card_url, headers=headers).json()["url"].rstrip("/") + "/v1/message:stream"
+
+payload = {"request": {"messageId": str(uuid.uuid4()), "role": "ROLE_USER",
+                       "content": {"text": question}}}
+resp = requests.post(stream_url, json=payload, headers=headers)
+```
+
+#### 3. The signal — key off `metadata.gda_message.subType`:
+```python
+st = part["metadata"]["gda_message"]["subType"]
+if st == "matched_query_question":   # the verified query's NL question
+    matched_question = part["text"]
+elif st == "matched_query_sql":      # the verified query's authored SQL
+    matched_sql = part["text"]
+
+verified_query_matched = matched_question is not None   # <- the "checkmark"
+```
+
+#### 💡 Why not just use `chat()`?
+
+On the native `chat()` stream a matched verified query is only mentioned in the model's `THOUGHT` prose; `SystemMessage.example_queries` is not emitted for agent-backed chat, and `TextMessage` has no citations field. So **A2A is currently the only path that returns the match as structured, parseable data.**
+
+> [!NOTE]
+> `create_data_agent` reuse does **not** update an existing agent's published context. If you change the verified SQL, either call `update_data_agent` or bump `agent_id`.
 
 ---
 
