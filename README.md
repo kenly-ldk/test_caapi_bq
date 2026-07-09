@@ -164,7 +164,7 @@ By printing the raw response object, you get full visibility into the agent's wo
 
 ---
 
-### 🕵️‍♂️ Persistent Agent Chat (`agent_stateless/main.py`)
+### 🕵️‍♂️ Persistent Agent — Stateless Chat (`agent_stateless/main.py`)
 
 This script creates an agent once and then uses `DataAgentContext` to reference it.
 
@@ -277,6 +277,44 @@ if "citation" in sm:                              # proto-plus presence check
 > you not just **that** a verified query was used, but **which span** of the
 > answer it backs. The A2A path is still the one that surfaces the match as
 > dedicated top-level message parts — see below.
+
+---
+
+### 🧵 Stateful Conversation (`agent_stateful/main.py`)
+
+Same persistent agent as above, but you chat *through* a server-side
+`Conversation`, so the server retains history across turns. (Requires
+`cloudaicompanion.googleapis.com` — see the caution in the previous section.)
+
+#### 1. Ensure a `Conversation` exists (this is what holds the history):
+```python
+convo = geminidataanalytics.Conversation()
+convo.agents = [agent_name]
+data_chat_client.create_conversation(
+    request=geminidataanalytics.CreateConversationRequest(
+        parent=f"projects/{billing_project}/locations/{location}",
+        conversation_id=convo_id,
+        conversation=convo,
+    )
+)
+```
+
+#### 2. Chat via `ConversationReference` (instead of `data_agent_context`):
+```python
+convo_ref = geminidataanalytics.ConversationReference()
+convo_ref.conversation = convo_name
+convo_ref.data_agent_context = agent_context   # same agent context as the stateless script
+
+chat_request = geminidataanalytics.ChatRequest(
+    parent=...,
+    conversation_reference=convo_ref,           # server persists history across turns
+    messages=[...],
+)
+```
+
+The streamed message shapes are identical to the stateless agent path (same
+`--parse` decoder applies); the only difference is that follow-up turns sent to
+the same `conversation` remember what came before.
 
 ---
 
