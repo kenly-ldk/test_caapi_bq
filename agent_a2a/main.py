@@ -1,43 +1,51 @@
 """
-A2A (Agent-to-Agent) Approach — the ONLY path that exposes the
-"verified / example query matched" signal as structured data.
+A2A (Agent-to-Agent) Approach — exposes the "verified / example query matched"
+signal as dedicated top-level message parts.
 
-Why this file exists (vs. test_caapi_bq_chat.py / test_caapi_bq_agent.py):
+Why this file exists (vs. inline_chat/main.py / agent_stateless/main.py):
 
-    The native `DataChatServiceClient.chat()` stream (used by the other two
-    scripts) does NOT surface a discrete "this answer reused one of your
-    authored example_queries" signal. When a question matches a verified
-    query, the only trace on the native path is inside the model's THOUGHT
-    prose ("...Example Query 3... it's a direct hit... I will execute this
-    exact example query") — there is no typed field to key off, and the
-    `SystemMessage.example_queries` message is never emitted for agent chat.
-
-    The A2A streaming endpoint (`.../v1/message:stream`) DOES emit it, as two
-    dedicated message parts tagged via `metadata.gda_message.subType`:
+    The A2A streaming endpoint (`.../v1/message:stream`) is a different transport
+    (raw HTTP JSON) that surfaces a verified-query hit as two dedicated message
+    parts tagged via `metadata.gda_message.subType`:
         - "matched_query_question"  -> the verified query's NL question
         - "matched_query_sql"       -> the verified query's authored SQL
     These are exactly what the BigQuery Conversational Analytics UI renders as
-    the little "verified" checkmark. So if you need to programmatically detect
-    a verified-query hit, this is the path to use.
+    the little "verified" checkmark.
+
+    NOTE: the native `DataChatServiceClient.chat()` path (used by the other
+    scripts) ALSO surfaces the match as structured data — a `data.matched_query`
+    message plus a `citation` with `source_type` + byte anchors — so A2A is not
+    the *only* structured path, just the flattest, SDK-free one. Pick A2A when
+    you want plain JSON parts without the SDK; pick native when you want the
+    citation to also tell you *which span* of the answer the query backs.
 
 This script:
     1. Creates (or reuses) a persistent Data Agent whose published context
        carries ONE authored `ExampleQuery` (a "verified query").
     2. Fetches the agent's public A2A AgentCard to discover its stream URL.
     3. Sends a question that matches the verified query over A2A.
-    4. Parses the stream and highlights the matched_query_* signal.
+    4. Prints the A2A stream response — raw verbatim by default, or a compact
+       typed summary with `--parse`.
 
 Run (same setup as the other scripts — ADC via `gcloud auth application-default login`):
     pip install google-cloud-geminidataanalytics requests
-    python3 test_caapi_bq_a2a.py
+    python3 agent_a2a/main.py            # raw verbatim JSON
+    python3 agent_a2a/main.py --parse    # typed, one-line-per-part summary
 """
 import json
+import sys
 import uuid
 
 import requests
 import google.auth
 from google.auth.transport.requests import Request as AuthRequest
 from google.cloud import geminidataanalytics
+
+# Output mode:
+#   (default)  -> print the raw A2A JSON stream VERBATIM
+#   --parse    -> decode each envelope/part into a compact, typed summary
+#                 (task lifecycle + gda_message.subType parts)
+PARSE = "--parse" in sys.argv
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -157,81 +165,67 @@ payload = {
         "content": {"text": question},
     }
 }
-print(f"\n--- Asking over A2A ---\nQ: {question}")
+print(f"\n--- Asking over A2A ---\nQ: {question}{'  [--parse]' if PARSE else ''}")
 resp = requests.post(stream_url, json=payload, headers=headers, timeout=300)
 resp.raise_for_status()
-envelopes = json.loads(resp.content.decode("utf-8", errors="replace"))
+raw = resp.content.decode("utf-8", errors="replace")
 
 
 # ---------------------------------------------------------------------------
-# 4. Parse the stream and pull out the match signal
+# 4. Emit the A2A stream — raw verbatim, or a typed summary with --parse
 # ---------------------------------------------------------------------------
-def parts_from_envelope(env: dict) -> list:
-    """A2A envelopes come in three shapes; content parts can live in any."""
-    if "statusUpdate" in env:
-        return env["statusUpdate"].get("status", {}).get("message", {}).get("content", []) or []
+def _preview(text, limit=140):
+    s = " ".join(str(text).split())
+    return s if len(s) <= limit else s[: limit - 1] + "…"
+
+
+def _describe_part(part: dict) -> str:
+    """One A2A content/artifact part -> 'subType: value'. Parts carry their type
+    in metadata.gda_message.subType and hold either `text` or structured `data`."""
+    st = ((part.get("metadata") or {}).get("gda_message") or {}).get("subType", "?")
+    text = part.get("text")
+    if text:
+        return f"{st}: {_preview(text)}"
+    if "data" in part:
+        data = (part.get("data") or {}).get("data", {})
+        if {"projectId", "datasetId", "tableId"} <= set(data):  # bigquery_table_reference
+            return f"{st}: {data['projectId']}.{data['datasetId']}.{data['tableId']}"
+        if "jobId" in data:
+            return f"{st}: job_id={data.get('jobId')} location={data.get('location')}"
+        return f"{st}: {_preview(json.dumps(data)) if data else '(empty)'}"
+    return f"{st}: (empty)"
+
+
+def _describe_envelope(env: dict) -> list:
+    """A2A envelopes come in three shapes: task / statusUpdate / artifactUpdate."""
+    lines = []
     if "task" in env:
-        return env["task"].get("status", {}).get("message", {}).get("content", []) or []
-    if "artifactUpdate" in env:
-        return env["artifactUpdate"].get("artifact", {}).get("parts", []) or []
-    return []
+        t = env["task"]
+        lines.append(f"TASK: state={t.get('status', {}).get('state')} id={t.get('id')}")
+    elif "statusUpdate" in env:
+        su = env["statusUpdate"]
+        status = su.get("status", {})
+        msg = status.get("message")
+        if msg:
+            for part in msg.get("content", []) or []:
+                lines.append(f"STATUS {_describe_part(part)}")
+        else:
+            fin = " (final)" if su.get("final") else ""
+            lines.append(f"STATUS: state={status.get('state')}{fin}")
+    elif "artifactUpdate" in env:
+        art = env["artifactUpdate"].get("artifact", {})
+        name = art.get("name")
+        for part in art.get("parts", []) or []:
+            lines.append(f"ARTIFACT[{name}] {_describe_part(part)}")
+    return lines
 
-
-def sub_type(part: dict) -> str:
-    return ((part.get("metadata") or {}).get("gda_message") or {}).get("subType", "")
-
-
-def task_error(env: dict) -> str | None:
-    """Return the error text if an envelope reports a FAILED task, else None."""
-    status = (env.get("statusUpdate", {}).get("status")
-              or env.get("task", {}).get("status") or {})
-    if status.get("state") == "TASK_STATE_FAILED":
-        parts = status.get("message", {}).get("content", []) or []
-        return " ".join(p.get("text", "") for p in parts).strip() or "<failed, no detail>"
-    return None
-
-
-matched_question = None
-matched_sql = None
-final_answer_parts = []
-subtypes_seen = {}
-error_text = None
-
-for env in envelopes:
-    error_text = error_text or task_error(env)
-    for part in parts_from_envelope(env):
-        st = sub_type(part)
-        subtypes_seen[st] = subtypes_seen.get(st, 0) + 1
-        text = part.get("text", "") or ""
-        if st == "matched_query_question":
-            matched_question = text.strip()
-        elif st == "matched_query_sql":
-            matched_sql = text.strip().removeprefix("```sql").removesuffix("```").strip()
-        elif st == "final_response":
-            if text.strip():
-                final_answer_parts.append(text.strip())
 
 print("\n" + "=" * 60)
-print("RESULT")
+print(f"A2A RESPONSE (HTTP {resp.status_code}){'  [--parse]' if PARSE else ''}")
 print("=" * 60)
-print(f"subTypes seen: {subtypes_seen}")
-
-if error_text:
-    print(f"\n❌ Stream reported a FAILED task:\n   {error_text}")
-    if "cloudaicompanion" in error_text:
-        print("\n   Hint: the A2A stream creates a server-side conversation, which needs the")
-        print("   Gemini for Google Cloud API. Enable it, then retry:")
-        print(f"     gcloud services enable cloudaicompanion.googleapis.com --project={billing_project}")
-    raise SystemExit(1)
-
-verified_query_matched = matched_question is not None
-print(f"\n✅ verified_query_matched: {verified_query_matched}")
-if verified_query_matched:
-    print(f"   matched_query_question: {matched_question!r}")
-    print(f"   matched_query_sql:\n{matched_sql}")
+if PARSE:
+    for env in json.loads(raw):
+        for line in _describe_envelope(env):
+            print(line)
 else:
-    print("   (No matched_query_* parts — the question did not hit a verified query,")
-    print("    or the agent has no example_queries. This is exactly the case where")
-    print("    the native chat() path also gives you no structured signal.)")
-
-print(f"\nFinal answer:\n{chr(10).join(final_answer_parts) or '<none>'}")
+    print(raw)

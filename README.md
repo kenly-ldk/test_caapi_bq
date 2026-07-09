@@ -1,6 +1,6 @@
 # Conversational Analytics API (GDA) Integration Guide
 
-This guide walkthroughs three approaches for interacting with BigQuery data using the Gemini Data Analytics (`geminidataanalytics_v1alpha`) API: **Stateless Chat**, **Persistent Agent Chat**, and **A2A streaming** (the only path that exposes the *verified/example-query matched* signal).
+This guide walkthroughs four approaches for interacting with BigQuery data using the Gemini Data Analytics (`geminidataanalytics_v1alpha`) API: **Stateless Chat** (inline context), **Persistent Agent Chat** (saved context, stateless chat — *no companion API needed*), **Stateful Conversation** (server-managed history — *requires companion API*), and **A2A streaming** (surfaces the *verified/example-query matched* signal as dedicated message parts).
 
 ---
 
@@ -44,39 +44,80 @@ Activate your virtual environment and run the scripts using your `gcloud` config
 source venv_caapi/bin/activate
 
 # Execute Stateless Chat (Inline Context)
-python3 test_caapi_bq_chat.py
+python3 inline_chat/main.py
 
-# Execute Persistent Agent Chat (Saved Context)
-python3 test_caapi_bq_agent.py
+# Execute Persistent Agent Chat (Saved Context, STATELESS chat — no companion API)
+python3 agent_stateless/main.py
+
+# Execute Stateful Conversation (server-managed history — needs companion API)
+python3 agent_stateful/main.py
 
 # Execute A2A streaming (captures the "verified query matched" signal)
-python3 test_caapi_bq_a2a.py
+python3 agent_a2a/main.py
+
+# Any of them also accepts --parse to decode the stream into a typed summary
+python3 agent_stateless/main.py --parse
+```
+
+All four scripts use the **same question and context** (same datasource, system
+instruction, and one verified `example_query`) so their outputs are directly
+comparable. By default each prints the **raw, verbatim** stream response; add
+`--parse` to any of them to decode each streamed message into a compact, typed
+summary (see *Parsing the Stream* below).
+
+### 📁 Repo Layout
+
+Each script lives in its own folder next to a captured `output.verbatim.txt` from a sample run:
+
+```
+inline_chat/       # Inline context, native SDK, stateless chat
+  ├── main.py
+  ├── output.verbatim.txt  # captured verbatim run
+  └── output.parsed.txt    # captured `--parse` run (typed summary)
+agent_stateless/   # Published agent, native SDK, stateless chat (DataAgentContext)
+  ├── main.py
+  ├── output.verbatim.txt
+  └── output.parsed.txt
+agent_stateful/    # Published agent, native SDK, stateful chat (ConversationReference)
+  ├── main.py
+  ├── output.verbatim.txt
+  └── output.parsed.txt
+agent_a2a/         # Published agent, A2A HTTP stream (verified-query match parts)
+  ├── main.py
+  ├── output.verbatim.txt
+  └── output.parsed.txt
 ```
 
 ---
 ## 🚀 Overview of Approaches
 
-### 1. Stateless Chat (`test_caapi_bq_chat.py`)
+### 1. Stateless Chat (`inline_chat/main.py`)
 In the stateless approach, you define the data sources and instructions **inline** with every single request. The server doesn't remember your schema or rules.
 
 *   **Best for**: Ad-hoc queries, transient sessions, or when schema changes frequently.
 *   **Drawback**: Larger payload sizes (sending schema every time).
 
-### 2. Persistent Agent (`test_caapi_bq_agent.py`)
-In the persistent approach, you create a named **Data Agent** on the server. The schema and rules are saved in the agent's configuration. You then chat with the agent by reference.
+### 2. Persistent Agent — Stateless Chat (`agent_stateless/main.py`)
+Create a named **Data Agent** on the server; its schema and rules are saved in the agent's configuration. You then chat with it by reference via `DataAgentContext`. The **agent** is stateful (remembers its saved config), but the **chat** is stateless — the server keeps no conversation history.
 
-*   **Best for**: Production portals, repeatable workflows, fixed database schemas.
-*   **Drawback**: Requires a setup step to create the agent.
+*   **Best for**: Production portals, repeatable workflows, fixed schemas — *without* enabling any extra API.
+*   **Only needs**: `geminidataanalytics.googleapis.com`. **No `cloudaicompanion`.**
+*   **Drawback**: No server-side history — for multi-turn you resend prior turns yourself in the `messages` list.
 
-### 3. A2A Streaming (`test_caapi_bq_a2a.py`)
-Both approaches above call `DataChatServiceClient.chat()`. That native stream does **not** surface a structured "this answer reused one of your authored `example_queries`" signal — when a question matches a verified query, the only trace is inside the model's free-text *THOUGHT* ("…Example Query 3… it's a direct hit…"). There is no typed field to key off.
+### 3. Persistent Agent — Stateful Conversation (`agent_stateful/main.py`)
+Same persistent agent, but you chat *through* a named **`Conversation`** object via `ConversationReference`. Now the **server persists history**, so follow-up turns remember earlier ones automatically.
 
-The **A2A streaming endpoint** (`.../v1/message:stream`) is the only path that emits the match as structured data, via `metadata.gda_message.subType`:
+*   **Best for**: Multi-turn assistants, audit logs, shared context across a workflow.
+*   **Requires**: `cloudaicompanion.googleapis.com` (Gemini for Google Cloud) — see the caution below.
+*   **Drawback**: Extra API enablement; server-side conversation objects to manage.
+
+### 4. A2A Streaming (`agent_a2a/main.py`)
+The three approaches above call `DataChatServiceClient.chat()`. The A2A **streaming endpoint** (`.../v1/message:stream`) is a different transport (raw HTTP JSON) that surfaces the verified-query match as **dedicated top-level message parts**, via `metadata.gda_message.subType`:
 
 *   `matched_query_question` — the verified query's natural-language question
 *   `matched_query_sql` — the verified query's authored SQL
 
-These are exactly what the BigQuery Conversational Analytics **UI renders as the "verified" checkmark**.
+These are exactly what the BigQuery Conversational Analytics **UI renders as the "verified" checkmark**. (The native `chat()` path *also* exposes the match — as a `data.matched_query` message plus a `citation` with `source_type` + byte anchors — so A2A is not the *only* structured path; it's just the flattest, SDK-free one. See the A2A section for the full comparison.)
 
 *   **Best for**: Programmatically detecting when an answer was backed by a verified/example query (governance, audit, "trusted answer" badges).
 *   **Drawback**: Raw HTTP (no typed SDK client); you parse A2A envelopes yourself. Requires the agent to actually carry at least one `example_query`.
@@ -85,7 +126,7 @@ These are exactly what the BigQuery Conversational Analytics **UI renders as the
 
 ## 📂 Code Walkthrough & Nuances
 
-### 🐍 Stateless Chat (`test_caapi_bq_chat.py`)
+### 🐍 Stateless Chat (`inline_chat/main.py`)
 
 This script sets up a `BigQueryTableReference` and passes it inline.
 
@@ -93,8 +134,15 @@ This script sets up a `BigQueryTableReference` and passes it inline.
 ```python
 # Pass schema INLINE
 inline_context = geminidataanalytics.Context()
-inline_context.system_instruction = "Help the user analyze their data."
+inline_context.system_instruction = "You are an expert urban forester in San Francisco. Analyze tree data accurately."
 inline_context.datasource_references = datasource_references
+# Same verified example query as the other scripts (so all four share one context)
+inline_context.example_queries = [
+    geminidataanalytics.ExampleQuery(
+        natural_language_question="Which species of tree is most prevalent?",
+        sql_query="SELECT species, COUNT(*) AS tree_count FROM ... GROUP BY species ORDER BY tree_count DESC LIMIT 10",
+    )
+]
 
 request = geminidataanalytics.ChatRequest(
     inline_context=inline_context, # Inline context passed here
@@ -105,7 +153,7 @@ request = geminidataanalytics.ChatRequest(
 
 #### 💡 Understanding Stream Event Types
 
-The `chat()` API returns a stream of events representing different stages of the agent's reasoning and actions. Since both scripts print the **raw `response` object**, you will see all these event types in your terminal output:
+The `chat()` API returns a stream of events representing different stages of the agent's reasoning and actions. Since the native scripts print the **raw `response` object** verbatim, you will see all these event types in your terminal output (and in the captured `output.verbatim.txt`):
 
 1.  **Status Messages**: Insights into the agent's thinking (e.g., "Retrieving context", "Analyzing Most Common Species").
 2.  **Raw SQL Queries**: The exact BigQuery queries generated by the agent.
@@ -116,7 +164,7 @@ By printing the raw response object, you get full visibility into the agent's wo
 
 ---
 
-### 🕵️‍♂️ Persistent Agent Chat (`test_caapi_bq_agent.py`)
+### 🕵️‍♂️ Persistent Agent Chat (`agent_stateless/main.py`)
 
 This script creates an agent once and then uses `DataAgentContext` to reference it.
 
@@ -145,12 +193,21 @@ chat_request = geminidataanalytics.ChatRequest(
 )
 ```
 
-#### 🚨 Critical Nuance: `ConversationReference` vs `DataAgentContext`
+#### 🚨 Critical Nuance: `DataAgentContext` vs `ConversationReference`
 
-The `test_caapi_bq_agent.py` script showcases a third section: **Fully Stateful Chat History**.
+There are **two ways to chat with the same persistent agent**, split across two
+scripts here:
 
-1.  **`DataAgentContext`**: Stateful Agent + Stateless Chat. (The agent remembers schema, but server forgets chat history).
-2.  **`ConversationReference`**: Stateful Agent + Stateful Chat. (Server remembers chat history and schema!).
+1.  **`DataAgentContext`** (`agent_stateless/main.py`): Stateful Agent + **Stateless Chat**. The agent remembers its saved schema/config, but the server keeps **no** chat history.
+2.  **`ConversationReference`** (`agent_stateful/main.py`): Stateful Agent + **Stateful Chat**. The server persists chat history in a named `Conversation`.
+
+> [!IMPORTANT]
+> **Can you converse with a published agent without enabling the companion API? Yes** —
+> use `DataAgentContext` (`agent_stateless/main.py`). It works with just
+> `geminidataanalytics.googleapis.com`. Because the chat is stateless, multi-turn
+> is *your* job: keep the running history client-side and pass it back in the
+> `messages` list on each call. You only need `ConversationReference` (and the
+> companion API) if you want the **server** to manage history for you.
 
 > [!CAUTION]
 > While `DataAgentContext` works with just the `geminidataanalytics.googleapis.com` API, the automated conversation history (`ConversationReference`) requires the `cloudaicompanion.googleapis.com` (Gemini for Google Cloud) API to be enabled in your project! 
@@ -158,9 +215,72 @@ The `test_caapi_bq_agent.py` script showcases a third section: **Fully Stateful 
 > [!TIP]
 > Enabling `cloudaicompanion.googleapis.com` also unlocks the **Gemini for Google Cloud Console UI**, allowing you to chat with your BigQuery Data Agents directly through the Google Cloud Web Console! If you want a GUI for internal users, this is the API to enable.
 
+#### 🧩 Parsing the Stream (`--parse`)
+
+The verbatim proto dump is great for auditing but noisy to consume. Adding
+`--parse` decodes **every** streamed message into one typed line, so you can see
+the shape of the whole turn at a glance. All three native scripts
+(`inline_chat/main.py`, `agent_stateless/main.py`, `agent_stateful/main.py`)
+share the same decoder — it
+handles all `SystemMessage` kinds — `text` (THOUGHT / FINAL_RESPONSE /
+FOLLOWUP_QUESTIONS), `data` (query / matched_query / big_query_job / result),
+`chart`, `schema`, `analysis`, `error` — plus the separate `citation` field.
+(The A2A script also takes `--parse`, but decodes its JSON-envelope format
+instead — see the A2A section below.) A sample run is captured in
+[`agent_stateless/output.parsed.txt`](agent_stateless/output.parsed.txt):
+
+```
+[grp 0] TEXT/THOUGHT (2 part(s)): Running a query | Executing: SELECT species, COUNT(*) ...
+[grp 0] TEXT/FINAL_RESPONSE (1 part(s)): To find the most prevalent tree species ...
+    ↳ citation: id='ex_0' source_type='example_query' title='Verified Query: Which species of tree is most prevalent?'
+    ↳ anchor: bytes[68:96] -> ['ex_0']
+[grp 0] DATA/query: datasources=['bigquery-public-data.san_francisco.street_trees']
+[grp 0] DATA/matched_query: NLQ='Which species of tree is most prevalent?' sql='SELECT species, COUNT(*) ...'
+[grp 0] DATA/big_query_job: job_id=job_8MpNRTeiAqubwd6grTTxDSROHZr5 location=US
+[grp 0] DATA/result: name='most_prevalent_tree_species' rows=10 cols=['species:STRING', 'tree_count:INTEGER']
+[grp 0] CHART/result: mark='bar' title='Top 10 Most Prevalent Tree Species in San Francisco' image_bytes=0
+[grp 0] TEXT/FOLLOWUP_QUESTIONS (3 part(s)):
+    - Which species of tree has the largest average DBH (diameter at breast height)?
+    ...
+```
+
+##### How the decoding works
+
+Each `SystemMessage` is a protobuf with a `kind` **oneof** — you branch on which
+field is set. `citation` is a *separate* top-level field (not part of `kind`), so
+it can ride along with a `FINAL_RESPONSE`:
+
+```python
+sm = response.system_message
+kind = sm._pb.WhichOneof("kind")          # 'text' | 'data' | 'chart' | 'schema' | 'analysis' | 'error'
+if kind == "data":
+    sub = sm.data._pb.WhichOneof("kind")  # 'query' | 'generated_sql' | 'result' | 'big_query_job' | 'matched_query'
+```
+
+The **citation `source_type`** is itself a oneof (`uri` / `example_query` /
+`glossary_term`), so you read it the same way — this is what tells you an answer
+was backed by a *verified query*, and the `anchors` pin it to a byte range of the
+response text:
+
+```python
+if "citation" in sm:                              # proto-plus presence check
+    for src in sm.citation.sources:
+        source_type = src._pb.WhichOneof("source_type")   # e.g. 'example_query'
+    for a in sm.citation.anchors:
+        span = (a.text_message_anchor.start_offset_bytes,
+                a.text_message_anchor.end_offset_bytes)
+```
+
+> [!NOTE]
+> On the native `chat()` path this typed `citation` (with `source_type` + byte
+> anchors) is actually *richer* than the A2A `matched_query_*` signal: it tells
+> you not just **that** a verified query was used, but **which span** of the
+> answer it backs. The A2A path is still the one that surfaces the match as
+> dedicated top-level message parts — see below.
+
 ---
 
-### 🔗 A2A Streaming (`test_caapi_bq_a2a.py`)
+### 🔗 A2A Streaming (`agent_a2a/main.py`)
 
 This script attaches a **verified query** to the agent, then talks to it over the **A2A `message:stream`** endpoint (raw HTTP, ADC bearer token) so it can read the match signal that the native `chat()` SDK never exposes.
 
@@ -186,23 +306,58 @@ payload = {"request": {"messageId": str(uuid.uuid4()), "role": "ROLE_USER",
 resp = requests.post(stream_url, json=payload, headers=headers)
 ```
 
-#### 3. The signal — key off `metadata.gda_message.subType`:
-```python
-st = part["metadata"]["gda_message"]["subType"]
-if st == "matched_query_question":   # the verified query's NL question
-    matched_question = part["text"]
-elif st == "matched_query_sql":      # the verified query's authored SQL
-    matched_sql = part["text"]
+#### 3. The signal — `metadata.gda_message.subType`:
 
-verified_query_matched = matched_question is not None   # <- the "checkmark"
+The script prints the raw A2A stream verbatim (see [`agent_a2a/output.verbatim.txt`](agent_a2a/output.verbatim.txt)). Within that stream, the verified-query match arrives as two parts you can key off:
+
+```json
+{ "text": "Which species of tree is most prevalent?",
+  "metadata": { "gda_message": { "subType": "matched_query_question" } } },
+{ "text": "```sql\nSELECT species, COUNT(*) ...\n```",
+  "metadata": { "gda_message": { "subType": "matched_query_sql" } } }
 ```
 
-#### 💡 Why not just use `chat()`?
+The presence of a `matched_query_question` part is the programmatic equivalent of the UI's "verified" checkmark.
 
-On the native `chat()` stream a matched verified query is only mentioned in the model's `THOUGHT` prose; `SystemMessage.example_queries` is not emitted for agent-backed chat, and `TextMessage` has no citations field. So **A2A is currently the only path that returns the match as structured, parseable data.**
+#### 4. Parsing the A2A stream (`--parse`):
+
+The A2A script also takes `--parse`, but its decoder is different from the native
+one: it walks the JSON envelopes (`task` / `statusUpdate` / `artifactUpdate`) and
+prints one line per part, keyed by `metadata.gda_message.subType`. A sample run is
+captured in [`agent_a2a/output.parsed.txt`](agent_a2a/output.parsed.txt):
+
+```
+TASK: state=TASK_STATE_WORKING id=eb4671f4-...
+STATUS thought: Analyzing context
+STATUS thought: Executing: SELECT species, COUNT(*) ...
+ARTIFACT[Final response] final_response: To find the most prevalent tree species ...
+STATUS query_datasource: bigquery-public-data.san_francisco.street_trees
+STATUS matched_query_question: Which species of tree is most prevalent?
+STATUS matched_query_sql: ```sql SELECT species, COUNT(*) ...
+ARTIFACT[BigQuery job] big_query_job: job_id=job_QeU5S7wHMIVt4V9q00e0PFBuiHWx location=US
+ARTIFACT[Data result] result_data: | species | tree_count | ...
+STATUS followup_questions: Which caretakers manage the most Sycamore: London Plane trees?
+STATUS: state=TASK_STATE_COMPLETED (final)
+```
+
+#### 💡 A2A vs. native `chat()` for the match signal
+
+**Both** paths surface the verified-query match as structured data — they just
+shape it differently (compare the captured `output.parsed.txt` files):
+
+*   **A2A** emits dedicated top-level parts tagged `matched_query_question` /
+    `matched_query_sql`, and renders the result as a markdown table.
+*   **Native `chat()`** emits a `data.matched_query.example_query` message **and**
+    attaches a `citation` (with `source_type="example_query"` + byte-range
+    `anchors`) to the `FINAL_RESPONSE`.
+
+So the older "A2A is the *only* structured path" framing no longer holds. The
+native `citation` is arguably richer (it pins the match to a span of the answer
+text); the A2A form is flatter and language-agnostic (plain JSON, no SDK needed).
+Pick based on whether you're already on the SDK.
 
 > [!NOTE]
-> `create_data_agent` reuse does **not** update an existing agent's published context. If you change the verified SQL, either call `update_data_agent` or bump `agent_id`.
+> `create_data_agent` reuse does **not** update an existing agent's published context. If you change the verified SQL, either call `update_data_agent` or bump `agent_id`. `agent_stateless/main.py` handles this by calling `update_data_agent` when the agent already exists; `agent_a2a/main.py` does not, so bump its `agent_id` if you edit its verified query.
 
 ---
 
