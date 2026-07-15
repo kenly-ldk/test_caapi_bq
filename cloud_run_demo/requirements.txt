@@ -1,0 +1,4 @@
+google-cloud-geminidataanalytics
+google-auth
+flask
+gunicorn
