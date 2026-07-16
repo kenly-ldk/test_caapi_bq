@@ -29,8 +29,8 @@ This script:
 
 Run (same setup as the other scripts — ADC via `gcloud auth application-default login`):
     pip install google-cloud-geminidataanalytics requests
-    python3 agent_a2a/main.py            # raw verbatim JSON
-    python3 agent_a2a/main.py --parse    # typed, one-line-per-part summary
+    python3 connection_approaches/agent_a2a/main.py            # raw verbatim JSON
+    python3 connection_approaches/agent_a2a/main.py --parse    # typed, one-line-per-part summary
 """
 import json
 import sys

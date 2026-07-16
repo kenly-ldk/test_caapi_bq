@@ -1,5 +1,5 @@
 # Per-workstation secrets / config (never commit real project + SA values)
-cloud_run_demo/config.env
+**/config.env
 
 # Python
 venv_caapi/

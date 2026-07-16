@@ -1,7 +1,7 @@
 """
 Cloud Run demo — chat with a PUBLISHED Data Agent, four identity models.
 
-This mirrors `agent_stateless/main.py`: instead of sending the schema/context
+This mirrors `connection_approaches/agent_stateless/main.py`: instead of sending the schema/context
 inline on every request, it chats against a **published Data Agent** by reference
 (`DataAgentContext`, PUBLISHED version). The agent itself is created/updated ONCE,
 out of band, by `ensure_agent.py` (run as the runtime SA at deploy time) — the app

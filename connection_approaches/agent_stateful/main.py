@@ -20,8 +20,8 @@ Both talk to the SAME persistent agent (same agent_id as agent_stateless/main.py
 this script ensures that agent exists, then chats through a Conversation.
 
 Run:
-    python3 agent_stateful/main.py            # raw verbatim proto dump
-    python3 agent_stateful/main.py --parse    # typed, one-line summary
+    python3 connection_approaches/agent_stateful/main.py            # raw verbatim proto dump
+    python3 connection_approaches/agent_stateful/main.py --parse    # typed, one-line summary
 """
 import sys
 from google.cloud import geminidataanalytics

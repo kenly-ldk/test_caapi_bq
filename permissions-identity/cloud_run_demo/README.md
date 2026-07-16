@@ -2,8 +2,8 @@
 
 A minimal, deployable web app that chats with a **published Data Agent** by
 reference (`DataAgentContext`), mirroring
-[`../agent_stateless/main.py`](../agent_stateless/main.py) (SF street trees, one
-verified example query). The agent is created once by
+[`agent_stateless/main.py`](../../connection_approaches/agent_stateless/main.py)
+(SF street trees, one verified example query). The agent is created once by
 [`ensure_agent.py`](ensure_agent.py); the app only references it, so the
 per-request identity needs just `dataAgentUser` (get + chat). The only thing that
 changes between deployments is **which credentials the CA API client is built
@@ -96,19 +96,11 @@ reason to, since their app never reads `Authorization`.)
 
 ## Identity models (`IDENTITY_MODE`)
 
-The **model L / 1 / 2 / 3 / 4** labels used here and below mirror the identity-knob
-table in the repo README's
-[☁️ Deployment & Identity Models](../README.md#-deployment--identity-models):
-
-| Model | Effective principal | Where |
-|---|---|---|
-| **L** | your user account (local ADC) | local dev only |
-| **1** | Compute **default** runtime SA | Cloud Run |
-| **2** | your **custom** runtime SA | Cloud Run |
-| **3** | an **impersonated** target SA | Cloud Run |
-| **4** | the **end user** (forwarded OAuth token) | Cloud Run |
-
-`IDENTITY_MODE` selects which of these the app uses at runtime:
+The **model L / 1 / 2 / 3 / 4** labels used here are defined in the canonical
+identity-knob table in the parent
+[☁️ Deployment & Identity Models](../README.md#-deployment--identity-models)
+(L = local ADC; 1 = default runtime SA; 2 = custom runtime SA; 3 = impersonated
+SA; 4 = end-user OAuth). `IDENTITY_MODE` selects which the app uses at runtime:
 
 | Mode | Effective identity at CA API + BigQuery | Notes |
 |---|---|---|
