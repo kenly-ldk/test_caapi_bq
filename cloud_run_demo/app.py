@@ -1,12 +1,17 @@
 """
-Cloud Run demo — one CA API call, four identity models.
+Cloud Run demo — chat with a PUBLISHED Data Agent, four identity models.
 
-This is the same inline-context `chat()` as `inline_chat/main.py` (SF street
-trees, one verified example query), wrapped in a tiny web app so it can be
-deployed to Cloud Run. The ONLY thing that changes between deployments is *which
-credentials the CA API client is built with* — selected by the `IDENTITY_MODE`
-env var. Whatever identity the client uses, the CA API propagates it to BigQuery
-(there is no separate data-plane identity for BigQuery).
+This mirrors `agent_stateless/main.py`: instead of sending the schema/context
+inline on every request, it chats against a **published Data Agent** by reference
+(`DataAgentContext`, PUBLISHED version). The agent itself is created/updated ONCE,
+out of band, by `ensure_agent.py` (run as the runtime SA at deploy time) — the app
+only *references* it, so the per-request identity needs just `dataAgentUser`
+(get + chat), not agent-create/update rights.
+
+The ONLY thing that changes between deployments is *which credentials the CA API
+client is built with* — selected by the `IDENTITY_MODE` env var. Whatever identity
+the client uses, the CA API propagates it to BigQuery (there is no separate
+data-plane identity for BigQuery).
 
 IDENTITY_MODE:
     adc         (default) Ambient Application Default Credentials. On Cloud Run
@@ -22,6 +27,7 @@ IDENTITY_MODE:
 Env:
     BILLING_PROJECT   GCP project for the API `parent` + BigQuery billing (required)
     LOCATION          CA API location (default: global)
+    AGENT_ID          published Data Agent id to chat with (required)
     IDENTITY_MODE     adc | impersonate | end_user   (default: adc)
     TARGET_SA         target SA email, required when IDENTITY_MODE=impersonate
 
@@ -41,18 +47,13 @@ SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
 BILLING_PROJECT = os.environ.get("BILLING_PROJECT", "")
 LOCATION = os.environ.get("LOCATION", "global")
+AGENT_ID = os.environ.get("AGENT_ID", "")
 IDENTITY_MODE = os.environ.get("IDENTITY_MODE", "adc").strip().lower()
 TARGET_SA = os.environ.get("TARGET_SA", "")
 
-# Same verified example query as the other scripts, so the demo shares one context.
-VERIFIED_NLQ = "Which species of tree is most prevalent?"
-VERIFIED_SQL = (
-    "SELECT species, COUNT(*) AS tree_count\n"
-    "FROM `bigquery-public-data.san_francisco.street_trees`\n"
-    "GROUP BY species\n"
-    "ORDER BY tree_count DESC\n"
-    "LIMIT 10"
-)
+# Default question — matches the verified example query baked into the published
+# agent by ensure_agent.py (so it registers as a verified-query "match").
+DEFAULT_QUESTION = "Which species of tree is most prevalent?"
 
 app = Flask(__name__)
 
@@ -98,7 +99,7 @@ def _preview(text, limit=200):
 
 def _summarize(response):
     """Compact typed summary of one streamed response (subset of the decoder in
-    inline_chat/main.py — enough to prove the call worked and show the identity)."""
+    agent_stateless/main.py — enough to prove the call worked and show the identity)."""
     sm = response.system_message
     kind = sm._pb.WhichOneof("kind")
     if kind == "text":
@@ -113,6 +114,8 @@ def _summarize(response):
         if sub == "result":
             r = sm.data.result
             return {"type": "data/result", "name": r.name, "rows": len(r.data)}
+        if sub == "matched_query":
+            return {"type": "data/matched_query"}
         return {"type": f"data/{sub}"}
     if kind == "chart":
         return {"type": "chart"}
@@ -123,15 +126,15 @@ def _summarize(response):
 
 @app.get("/")
 def health():
-    return jsonify(status="ok", identity_mode=IDENTITY_MODE,
+    return jsonify(status="ok", identity_mode=IDENTITY_MODE, agent_id=AGENT_ID,
                    billing_project=BILLING_PROJECT, location=LOCATION)
 
 
 @app.get("/ask")
 def ask():
-    question = request.args.get("q", VERIFIED_NLQ)
-    if not BILLING_PROJECT:
-        return jsonify(error="BILLING_PROJECT env var is required"), 500
+    question = request.args.get("q", DEFAULT_QUESTION)
+    if not BILLING_PROJECT or not AGENT_ID:
+        return jsonify(error="BILLING_PROJECT and AGENT_ID env vars are required"), 500
 
     bearer = None
     auth_header = request.headers.get("Authorization", "")
@@ -145,28 +148,16 @@ def ask():
 
     client = geminidataanalytics.DataChatServiceClient(credentials=credentials)
 
-    bq_ref = geminidataanalytics.BigQueryTableReference()
-    bq_ref.project_id = "bigquery-public-data"
-    bq_ref.dataset_id = "san_francisco"
-    bq_ref.table_id = "street_trees"
-
-    datasource_references = geminidataanalytics.DatasourceReferences()
-    datasource_references.bq.table_references = [bq_ref]
-
-    inline_context = geminidataanalytics.Context()
-    inline_context.system_instruction = (
-        "You are an expert urban forester in San Francisco. Analyze tree data accurately."
-    )
-    inline_context.datasource_references = datasource_references
-    inline_context.example_queries = [
-        geminidataanalytics.ExampleQuery(
-            natural_language_question=VERIFIED_NLQ, sql_query=VERIFIED_SQL
-        )
-    ]
+    # Reference the PUBLISHED agent (schema, system instruction, and verified query
+    # all live in its published_context — created once by ensure_agent.py).
+    agent_name = f"projects/{BILLING_PROJECT}/locations/{LOCATION}/dataAgents/{AGENT_ID}"
+    agent_context = geminidataanalytics.DataAgentContext()
+    agent_context.data_agent = agent_name
+    agent_context.context_version = geminidataanalytics.DataAgentContext.ContextVersion.PUBLISHED
 
     chat_request = geminidataanalytics.ChatRequest(
-        inline_context=inline_context,
         parent=f"projects/{BILLING_PROJECT}/locations/{LOCATION}",
+        data_agent_context=agent_context,
         messages=[geminidataanalytics.Message(
             user_message=geminidataanalytics.UserMessage(text=question)
         )],
@@ -175,10 +166,11 @@ def ask():
     try:
         events = [_summarize(r) for r in client.chat(request=chat_request)]
     except Exception as e:  # noqa: BLE001 — surface the identity/permission error to the caller
-        return jsonify(identity_mode=IDENTITY_MODE, question=question,
-                       error=str(e)), 502
+        return jsonify(identity_mode=IDENTITY_MODE, agent_id=AGENT_ID,
+                       question=question, error=str(e)), 502
 
-    return jsonify(identity_mode=IDENTITY_MODE, question=question, events=events)
+    return jsonify(identity_mode=IDENTITY_MODE, agent_id=AGENT_ID,
+                   question=question, events=events)
 
 
 if __name__ == "__main__":

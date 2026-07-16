@@ -26,6 +26,8 @@ RUNTIME="ca-demo-runtime@${PROJECT_ID}.iam.gserviceaccount.com"   # model 2 runt
 TARGET="ca-demo-target@${PROJECT_ID}.iam.gserviceaccount.com"     # model 3 impersonation target (holds CA+BQ)
 CALLER="ca-demo-caller@${PROJECT_ID}.iam.gserviceaccount.com"     # model 3/4 runtime (NO data roles)
 COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"  # Cloud Build source builder
+AGENT_ID="${AGENT_ID:-sf-trees-demo-agent}"                       # published Data Agent the app chats with
+PYBIN="${PYBIN:-python3}"                                         # python with google-cloud-geminidataanalytics
 
 # `g` wraps gcloud: plain by default, or through the `gc` profile wrapper if USE_GC=1.
 g() {
@@ -50,12 +52,26 @@ for SA in ca-demo-runtime ca-demo-target ca-demo-caller; do
 done
 
 echo "### 3. Data/control-plane roles on runtime (model 2) + target (model 3)"
+# dataAgentUser (get + chat) — the app chats a PUBLISHED agent via DataAgentContext,
+# so the chatting identity needs get+chat, NOT locations.chat (dataAgentStatelessUser).
 for SA in "${RUNTIME}" "${TARGET}"; do
-  for ROLE in roles/geminidataanalytics.dataAgentStatelessUser roles/bigquery.user; do
+  for ROLE in roles/geminidataanalytics.dataAgentUser roles/bigquery.user; do
     g projects add-iam-policy-binding "${PROJECT_ID}" \
       --member="serviceAccount:${SA}" --role="${ROLE}" --condition=None --quiet
   done
 done
+
+echo "### 3b. Create/update the published Data Agent (as deployer; needs dataAgentCreator/Owner)"
+# The deployer (${DEPLOYER}) is project owner here; the agent creator auto-gets
+# dataAgentOwner on it. The app only references this agent (chat-only).
+if [[ "${USE_GC:-0}" == "1" ]]; then
+  # shellcheck disable=SC1090
+  source ~/.bashrc; gc "admin--${PROJECT_ID}" "${PYBIN}" "${SOURCE_DIR}/ensure_agent.py" \
+    --project="${PROJECT_ID}" --location=global --agent-id="${AGENT_ID}"
+else
+  "${PYBIN}" "${SOURCE_DIR}/ensure_agent.py" \
+    --project="${PROJECT_ID}" --location=global --agent-id="${AGENT_ID}"
+fi
 
 echo "### 4. Impersonation: caller may mint tokens AS target (model 3)"
 g iam service-accounts add-iam-policy-binding "${TARGET}" \
@@ -80,13 +96,13 @@ echo "### 7a. Deploy model 2 — custom runtime SA (IDENTITY_MODE=adc)"
 g run deploy sf-trees-sa \
   --source "${SOURCE_DIR}" --project="${PROJECT_ID}" --region="${REGION}" \
   --service-account="${RUNTIME}" --no-allow-unauthenticated \
-  --set-env-vars="BILLING_PROJECT=${PROJECT_ID},LOCATION=global,IDENTITY_MODE=adc" --quiet
+  --set-env-vars="BILLING_PROJECT=${PROJECT_ID},LOCATION=global,AGENT_ID=${AGENT_ID},IDENTITY_MODE=adc" --quiet
 
 echo "### 7b. Deploy model 3 — impersonation (runtime=caller has NO data roles)"
 g run deploy sf-trees-impersonate \
   --source "${SOURCE_DIR}" --project="${PROJECT_ID}" --region="${REGION}" \
   --service-account="${CALLER}" --no-allow-unauthenticated \
-  --set-env-vars="BILLING_PROJECT=${PROJECT_ID},LOCATION=global,IDENTITY_MODE=impersonate,TARGET_SA=${TARGET}" --quiet
+  --set-env-vars="BILLING_PROJECT=${PROJECT_ID},LOCATION=global,AGENT_ID=${AGENT_ID},IDENTITY_MODE=impersonate,TARGET_SA=${TARGET}" --quiet
 
 echo "### 7c. Deploy model 4 — end-user OAuth (runtime=caller has NO data roles)"
 # Authenticated: Cloud Run's invocation ID token rides in X-Serverless-Authorization,
@@ -95,7 +111,7 @@ echo "### 7c. Deploy model 4 — end-user OAuth (runtime=caller has NO data role
 g run deploy sf-trees-enduser \
   --source "${SOURCE_DIR}" --project="${PROJECT_ID}" --region="${REGION}" \
   --service-account="${CALLER}" --no-allow-unauthenticated \
-  --set-env-vars="BILLING_PROJECT=${PROJECT_ID},LOCATION=global,IDENTITY_MODE=end_user" --quiet
+  --set-env-vars="BILLING_PROJECT=${PROJECT_ID},LOCATION=global,AGENT_ID=${AGENT_ID},IDENTITY_MODE=end_user" --quiet
 
 echo "### 8. Invoker IAM for the (now all authenticated) services"
 for SVC in sf-trees-sa sf-trees-impersonate sf-trees-enduser; do

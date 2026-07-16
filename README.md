@@ -87,7 +87,8 @@ agent_a2a/         # Published agent, A2A HTTP stream (verified-query match part
   ├── output.verbatim.txt
   └── output.parsed.txt
 cloud_run_demo/    # Deployable app showing Cloud Run identity models (SA / impersonation / end-user OAuth)
-  ├── app.py               # inline-context chat(), IDENTITY_MODE toggles the identity
+  ├── app.py               # chats a published agent (DataAgentContext); IDENTITY_MODE toggles the identity
+  ├── ensure_agent.py      # create/update the published Data Agent once
   ├── requirements.txt
   ├── Dockerfile
   ├── config.env.example   # copy to config.env (gitignored) and fill in
@@ -634,10 +635,13 @@ gcloud run deploy sf-trees-demo --source cloud_run_demo/ \
     --service-account="ca-demo@$PROJECT_ID.iam.gserviceaccount.com" \
     --project="$PROJECT_ID" --region="$REGION" --no-allow-unauthenticated
 
-# Grant that SA the two planes (control + data) and let a user invoke the service:
+# Grant that SA the two planes (control + data) and let a user invoke the service.
+# The demo chats a PUBLISHED agent via DataAgentContext, so the control-plane role
+# is dataAgentUser (get + chat). (Create the agent once with ensure_agent.py, as an
+# identity holding dataAgentCreator.)
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:ca-demo@$PROJECT_ID.iam.gserviceaccount.com" \
-    --role="roles/geminidataanalytics.dataAgentStatelessUser"
+    --role="roles/geminidataanalytics.dataAgentUser"
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:ca-demo@$PROJECT_ID.iam.gserviceaccount.com" \
     --role="roles/bigquery.user"           # + bigquery.dataViewer on the dataset/table

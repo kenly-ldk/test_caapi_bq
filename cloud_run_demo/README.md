@@ -1,10 +1,14 @@
 # Cloud Run demo — CA API identity models
 
-A minimal, deployable web app that wraps the same inline-context `chat()` as
-[`../inline_chat/main.py`](../inline_chat/main.py) (SF street trees, one verified
-example query). The only thing that changes between deployments is **which
-credentials the CA API client is built with** — chosen by the `IDENTITY_MODE`
-env var. Whatever identity the client uses, the CA API propagates it to BigQuery.
+A minimal, deployable web app that chats with a **published Data Agent** by
+reference (`DataAgentContext`), mirroring
+[`../agent_stateless/main.py`](../agent_stateless/main.py) (SF street trees, one
+verified example query). The agent is created once by
+[`ensure_agent.py`](ensure_agent.py); the app only references it, so the
+per-request identity needs just `dataAgentUser` (get + chat). The only thing that
+changes between deployments is **which credentials the CA API client is built
+with** — chosen by the `IDENTITY_MODE` env var. Whatever identity the client uses,
+the CA API propagates it to BigQuery.
 
 See the repo README's [☁️ Deployment & Identity Models](../README.md#-deployment--identity-models)
 for the full identity table this demo exercises.
@@ -13,7 +17,8 @@ for the full identity table this demo exercises.
 
 | File | Purpose |
 |---|---|
-| `app.py` | Flask app; `GET /ask?q=...` runs one `chat()` turn |
+| `app.py` | Flask app; `GET /ask?q=...` chats the published agent via `DataAgentContext` |
+| `ensure_agent.py` | create/update the published Data Agent once (run as the runtime SA/deployer) |
 | `Dockerfile` / `requirements.txt` | container (gunicorn on `$PORT`) |
 | `config.env.example` | copy to `config.env` (gitignored) and fill in |
 | `deploy.sh` | `gcloud run deploy` (explicit `--project`) |
@@ -25,9 +30,12 @@ for the full identity table this demo exercises.
 ```bash
 cp config.env.example config.env   # then edit real values
 
-# Local smoke test (uses your own ADC = model L):
+# Create the published Data Agent once (needs dataAgentCreator):
 pip install -r requirements.txt
-BILLING_PROJECT=<your-project> IDENTITY_MODE=adc python3 app.py &
+python3 ensure_agent.py --project=<your-project> --agent-id=sf-trees-demo-agent
+
+# Local smoke test (uses your own ADC = model L):
+BILLING_PROJECT=<your-project> AGENT_ID=sf-trees-demo-agent IDENTITY_MODE=adc python3 app.py &
 curl "localhost:8080/ask?q=Which+species+of+tree+is+most+prevalent%3F"
 
 # Deploy to Cloud Run (runtime SA = model 1/2):
@@ -55,6 +63,36 @@ captured as runnable scripts:
 > no auth gives `403`. For the **end-user** service you send **two headers**:
 > `X-Serverless-Authorization: Bearer <ID token>` (Cloud Run invocation) and
 > `Authorization: Bearer <end-user token>` (relayed by the app to CA API/BigQuery).
+
+### Which header carries what — and why it differs by model
+
+Cloud Run's invocation check reads its ID token from the **`Authorization`** header
+**by default**. So the only question per model is: *does the app itself also need
+`Authorization`?*
+
+| | App needs `Authorization`? | Invocation ID token goes in | Why |
+|---|---|---|---|
+| **Model 2 / 3** | **No** — data identity is the runtime SA / an in-code impersonated SA | `Authorization` (default) | nothing else wants the header, so Cloud Run uses it |
+| **Model 4** | **Yes** — it relays the end user's access token to CA API/BigQuery | `X-Serverless-Authorization` | `Authorization` is taken by the end-user token |
+
+It is a **header-collision** choice, not a per-model requirement. For models 2/3
+Cloud Run validates the ID token in `Authorization` and passes the header through
+to the container, but the app ignores it — no conflict. For model 4 the app needs
+`Authorization` for the end-user token; if you put that access token there, Cloud
+Run tries to validate it as an *invocation* credential and fails with `401` (an
+access token is not an OIDC ID token for the service audience).
+
+That is exactly what `X-Serverless-Authorization` is for. **Cloud Run's rule: if
+`X-Serverless-Authorization` is present, it is used for the invocation check and
+`Authorization` is passed untouched to your service.** So model 4 sends:
+
+```
+X-Serverless-Authorization: Bearer <ID token>          # -> Cloud Run run.invoker check
+Authorization:              Bearer <end-user token>    # -> your app -> CA API -> BigQuery
+```
+
+(Models 2/3 *could* also use `X-Serverless-Authorization`; there is just no
+reason to, since their app never reads `Authorization`.)
 
 ## Identity models (`IDENTITY_MODE`)
 

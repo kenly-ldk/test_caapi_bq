@@ -3,10 +3,14 @@
 # re-run). Config from ./config.env; --project passed explicitly everywhere.
 #
 # Grants, by identity model:
-#   Control plane : roles/geminidataanalytics.dataAgentStatelessUser  (call chat)
+#   Control plane : roles/geminidataanalytics.dataAgentUser  (get + chat a PUBLISHED agent)
 #   Data plane    : roles/bigquery.user + roles/bigquery.dataViewer   (read BQ)
 #   Invoke        : roles/run.invoker on the service, for INVOKER_MEMBER
 #   Impersonation : roles/iam.serviceAccountTokenCreator on TARGET_SA (model 3)
+#
+# NOTE: the app chats a PUBLISHED Data Agent via DataAgentContext, so create the
+# agent once first (needs dataAgentCreator):
+#   python3 ensure_agent.py --project=$PROJECT_ID --agent-id=$AGENT_ID
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +32,7 @@ fi
 
 echo "Granting control + data plane roles to ${DATA_PRINCIPAL}..."
 for ROLE in \
-  roles/geminidataanalytics.dataAgentStatelessUser \
+  roles/geminidataanalytics.dataAgentUser \
   roles/bigquery.user \
   roles/bigquery.dataViewer; do
   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
