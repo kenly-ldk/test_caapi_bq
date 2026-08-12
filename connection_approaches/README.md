@@ -100,6 +100,37 @@ def send_turn(text):
 Note the history grows fast — in the captured runs it reaches **33 messages** by
 turn 3, and every message is resent on each call. Truncation is your job.
 
+#### Is replaying `messages` an *officially supported* mechanism? Yes.
+
+This is the documented design for the stateless modes, not a workaround:
+
+*   [**State management**](https://docs.cloud.google.com/gemini/data-agents/conversational-analytics-api/state-management)
+    — for `DataAgentContext` and `InlineContext` the conversation history is
+    *"Managed by your application"*: **"Your application must manage and provide
+    the full conversation history with each request."** (For
+    `ConversationReference` it is *"Managed by the API… You send only the new
+    message for each turn."*)
+*   [**API overview**](https://docs.cloud.google.com/gemini/data-agents/conversational-analytics-api/overview)
+    — "Chat by using a data agent reference … **For multi-turn conversations, your
+    application must manage and provide the conversation history with each
+    request.**"
+*   [**`chat` REST reference**](https://docs.cloud.google.com/gemini/data-agents/reference/rest/v1/projects.locations/chat)
+    — the field is `messages[] object (Message)`, *Required. **"Content of current
+    conversation."*** It is a **repeated** field describing the conversation (not
+    a single message), and it is the only field in `ChatRequest` that carries
+    conversational content — so it is the vehicle the sentences above refer to.
+
+> [!NOTE]
+> **What the docs do *not* pin down: the exact shape of the replayed history.**
+> They mandate providing "the full conversation history" but don't prescribe
+> *which* messages to include. Replaying **every** streamed `system_message`
+> verbatim (as the code above does) is *our implementation choice* — it is the
+> natural reading of a repeated `Message` with a `user_message` / `system_message`
+> oneof, and it demonstrably works (see the proof below). Equally valid-looking
+> alternatives the docs neither endorse nor forbid: replaying only the user turns
+> plus each `FINAL_RESPONSE`, or summarizing older turns to bound payload growth.
+> Treat the replay *strategy* as tunable, not canonical.
+
 ### Server-side history (`agent_stateful`, `agent_a2a`)
 
 `agent_stateful` sends only the new question; the named `Conversation` holds the
