@@ -47,6 +47,11 @@ from google.cloud import geminidataanalytics
 #                 (task lifecycle + gda_message.subType parts)
 PARSE = "--parse" in sys.argv
 
+# Multi-turn mode:
+#   --followup -> run a SECOND turn by echoing the `contextId` the server returned
+#                 (a `.../conversations/<uuid>` resource), so history is SERVER-side.
+FOLLOWUP = "--followup" in sys.argv
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -56,6 +61,12 @@ agent_id = "sf-trees-analyst-a2a"  # distinct from the other scripts' agent
 
 # A question that should MATCH the verified query we author below.
 question = "Which species of tree is most prevalent?"
+# Turn 2 refers back to turn 1 ("that top species"); turn 3 refers back to BOTH
+# ("those trees" = that species + that caretaker) — a multi-hop memory test.
+FOLLOWUP_QUESTIONS = [
+    "For that top species, which caretaker manages the most trees?",
+    "And what is the average DBH of those trees?",
+]
 
 # The verified / example query we attach to the agent. Because the NL question
 # closely matches `question` above, the CA engine should treat it as a "hit"
@@ -158,17 +169,39 @@ print(f"Stream endpoint: {stream_url}")
 # ---------------------------------------------------------------------------
 # 3. Send the question over A2A and stream the response
 # ---------------------------------------------------------------------------
-payload = {
-    "request": {
+def ask(text, context_id=None):
+    """POST one A2A turn. Passing `contextId` back joins the SAME conversation,
+    which is how multi-turn works on this transport: the id the server returns is
+    literally a `.../conversations/<uuid>` resource, so history is SERVER-side —
+    we never replay the transcript."""
+    request_body = {
         "messageId": str(uuid.uuid4()),
         "role": "ROLE_USER",
-        "content": {"text": question},
+        "content": {"text": text},
     }
-}
+    if context_id:
+        request_body["contextId"] = context_id
+    r = requests.post(stream_url, json={"request": request_body},
+                      headers=headers, timeout=300)
+    r.raise_for_status()
+    return r, r.content.decode("utf-8", errors="replace")
+
+
+def extract_context_id(raw_text):
+    """Pull the contextId (a conversations/... resource) out of the A2A stream."""
+    try:
+        for env in json.loads(raw_text):
+            for key in ("task", "statusUpdate", "artifactUpdate"):
+                node = env.get(key) or {}
+                if node.get("contextId"):
+                    return node["contextId"]
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 print(f"\n--- Asking over A2A ---\nQ: {question}{'  [--parse]' if PARSE else ''}")
-resp = requests.post(stream_url, json=payload, headers=headers, timeout=300)
-resp.raise_for_status()
-raw = resp.content.decode("utf-8", errors="replace")
+resp, raw = ask(question)
 
 
 # ---------------------------------------------------------------------------
@@ -229,3 +262,28 @@ if PARSE:
             print(line)
 else:
     print(raw)
+
+
+# ---------------------------------------------------------------------------
+# 5. Multi-turn (--followup): rejoin the SAME contextId and ask a referential
+#    question. Nothing from turn 1 is resent — if the agent resolves "that top
+#    species", the history came from the server-side conversation.
+# ---------------------------------------------------------------------------
+if FOLLOWUP:
+    ctx = extract_context_id(raw)
+    if not ctx:
+        print("\nNo contextId found in the first response; cannot continue the conversation.")
+    else:
+        for i, q in enumerate(FOLLOWUP_QUESTIONS, start=2):
+            print("\n" + "=" * 60)
+            print(f"TURN {i} — rejoining contextId={ctx}")
+            print("=" * 60)
+            print(f"Q: {q}")
+            resp_n, raw_n = ask(q, context_id=ctx)
+            print(f"\nA2A RESPONSE (HTTP {resp_n.status_code}){'  [--parse]' if PARSE else ''}")
+            if PARSE:
+                for env in json.loads(raw_n):
+                    for line in _describe_envelope(env):
+                        print(line)
+            else:
+                print(raw_n)

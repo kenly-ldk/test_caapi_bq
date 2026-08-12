@@ -11,6 +11,11 @@ location = "global"
 #                 (text / data / schema / chart / analysis / error + citations)
 PARSE = "--parse" in sys.argv
 
+# Multi-turn mode:
+#   --followup -> run TWO turns. Stateless chat keeps NO server-side history, so
+#                 we replay the transcript ourselves in the `messages` list.
+FOLLOWUP = "--followup" in sys.argv
+
 
 # ---------------------------------------------------------------------------
 # Parser: turn one streamed `response` into a compact, typed summary.
@@ -135,6 +140,12 @@ datasource_references.bq.table_references = [bigquery_table_reference_1]
 
 # Question (same as the A2A script)
 question = "Which species of tree is most prevalent?"
+# Turn 2 refers back to turn 1 ("that top species"); turn 3 refers back to BOTH
+# ("those trees" = that species + that caretaker) — a multi-hop memory test.
+FOLLOWUP_QUESTIONS = [
+    "For that top species, which caretaker manages the most trees?",
+    "And what is the average DBH of those trees?",
+]
 
 # Verified / example query (same as the A2A script)
 VERIFIED_NLQ = "Which species of tree is most prevalent?"
@@ -159,19 +170,41 @@ inline_context.example_queries = [
     )
 ]
 
-messages = [geminidataanalytics.Message()]
-messages[0].user_message.text = question
-
 # =====================================================================
 # Chat API Section (Streaming Conversation)
-#   default  -> raw verbatim dump   |   --parse -> typed summary
+#   default     -> raw verbatim dump   |   --parse -> typed summary
+#   --followup  -> run a SECOND, referential turn. This path is stateless, so
+#                  `history` below IS the agent's whole memory: we replay every
+#                  prior user + system message in `messages` on each call.
 # =====================================================================
+history = []
+
+
+def send_turn(text):
+    """Append a user turn, send the WHOLE transcript, fold replies back in."""
+    history.append(geminidataanalytics.Message(
+        user_message=geminidataanalytics.UserMessage(text=text)
+    ))
+    request = geminidataanalytics.ChatRequest(
+        inline_context=inline_context,   # inline context resent every call too
+        parent=f"projects/{billing_project}/locations/{location}",
+        messages=history,                # <-- full client-side transcript
+    )
+    replies = []
+    for response in data_chat_client.chat(request=request):
+        emit(response)
+        replies.append(response.system_message)
+    for sm in replies:
+        history.append(geminidataanalytics.Message(system_message=sm))
+
+
 print(f"Sending question: {question}{'  [--parse]' if PARSE else ''}")
-request = geminidataanalytics.ChatRequest(
-    inline_context=inline_context,
-    parent=f"projects/{billing_project}/locations/{location}",
-    messages=messages,
-)
-stream = data_chat_client.chat(request=request)
-for response in stream:
-    emit(response)
+send_turn(question)
+
+if FOLLOWUP:
+    # Turns 2 and 3 are REFERENTIAL — only resolvable from the replayed transcript.
+    for i, q in enumerate(FOLLOWUP_QUESTIONS, start=2):
+        print(f"\n--- Turn {i} (history replayed client-side: "
+              f"{len(history)} messages) ---")
+        print(f"Question: {q}")
+        send_turn(q)

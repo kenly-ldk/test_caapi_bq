@@ -20,7 +20,7 @@ Create a named **Data Agent** on the server; its schema and rules are saved in t
 
 *   **Best for**: Production portals, repeatable workflows, fixed schemas — *without* enabling any extra API.
 *   **Only needs**: `geminidataanalytics.googleapis.com`. **No `cloudaicompanion`.**
-*   **Drawback**: No server-side history — for multi-turn you resend prior turns yourself in the `messages` list.
+*   **Drawback**: No server-side history — multi-turn still works, but you resend prior turns yourself in the `messages` list (see [Multi-turn](#-multi-turn---followup--all-four-approaches-support-it)).
 
 ### 3. Persistent Agent — Stateful Conversation (`agent_stateful/main.py`)
 Same persistent agent, but you chat *through* a named **`Conversation`** object via `ConversationReference`. Now the **server persists history**, so follow-up turns remember earlier ones automatically.
@@ -39,6 +39,90 @@ These are exactly what the BigQuery Conversational Analytics **UI renders as the
 
 *   **Best for**: Programmatically detecting when an answer was backed by a verified/example query (governance, audit, "trusted answer" badges).
 *   **Drawback**: Raw HTTP (no typed SDK client); you parse A2A envelopes yourself. Requires the agent to actually carry at least one `example_query`.
+
+---
+
+## 🔁 Multi-turn (`--followup`) — all four approaches support it
+
+**Every** approach can hold a multi-turn conversation. What differs is **who
+stores the history**, not whether follow-ups are possible.
+
+Run a **3-turn** conversation on any of them:
+
+```bash
+python3 connection_approaches/inline_chat/main.py      --parse --followup
+python3 connection_approaches/agent_stateless/main.py  --parse --followup
+python3 connection_approaches/agent_stateful/main.py   --parse --followup
+python3 connection_approaches/agent_a2a/main.py        --parse --followup
+```
+
+The turns are deliberately **referential**, so they can only be answered if
+history really carried:
+
+1. *"Which species of tree is most prevalent?"*
+2. *"For **that top species**, which caretaker manages the most trees?"* → needs turn 1
+3. *"And what is the average DBH of **those trees**?"* → needs turns 1 **and** 2
+
+| Approach | Who stores history | What you send on turn N |
+|---|---|---|
+| `inline_chat` | **you** (client-side) | the whole transcript in `messages` + the inline context, every call |
+| `agent_stateless` | **you** (client-side) | the whole transcript in `messages` (context comes from the published agent) |
+| `agent_stateful` | **the server** (`Conversation`) | only the new question |
+| `agent_a2a` | **the server** (via `contextId`) | only the new question + the `contextId` to rejoin |
+
+### Client-side history (`inline_chat`, `agent_stateless`)
+
+The server keeps nothing, so the `messages` list **is** the agent's memory: append
+your question, send the full transcript, then fold the streamed replies back in.
+
+```python
+history = []
+
+def send_turn(text):
+    history.append(geminidataanalytics.Message(
+        user_message=geminidataanalytics.UserMessage(text=text)))
+    chat_request.messages = history          # <-- full client-side transcript
+    replies = []
+    for response in data_chat_client.chat(request=chat_request):
+        replies.append(response.system_message)
+    for sm in replies:                       # carry the agent's replies forward
+        history.append(geminidataanalytics.Message(system_message=sm))
+```
+
+Note the history grows fast — in the captured runs it reaches **33 messages** by
+turn 3, and every message is resent on each call. Truncation is your job.
+
+### Server-side history (`agent_stateful`, `agent_a2a`)
+
+`agent_stateful` sends only the new question; the named `Conversation` holds the
+rest. `agent_a2a` gets the same thing over raw HTTP by echoing back the
+**`contextId`** the first response returned — and that id is literally a
+conversation resource:
+
+```
+contextId = projects/<project>/locations/global/conversations/01b8c2df-6fac-…
+```
+
+> [!TIP]
+> That means the A2A transport gets **server-managed** multi-turn "for free" —
+> it is closer to `agent_stateful` than to the stateless paths, despite needing no
+> SDK. (It also implies the same `cloudaicompanion` dependency as any other
+> server-side conversation.)
+
+### Proof that history actually carried
+
+Captured in each folder's `output.followup.txt`. The decisive signal is the
+**generated SQL on turn 2**, which filters on a species string that appears
+nowhere in the question — it could only come from turn 1's result:
+
+```sql
+SELECT care_taker, COUNT(*) AS tree_count
+FROM `bigquery-public-data.san_francisco.street_trees`
+WHERE species = 'Platanus x hispanica :: Sycamore: London Plane'
+```
+
+Turn 3 then narrows to the average DBH of *those* trees, resolving references
+from **both** prior turns.
 
 ---
 

@@ -13,8 +13,22 @@ agent_id = "sf-trees-analyst-test"
 #                 (text / data / schema / chart / analysis / error + citations)
 PARSE = "--parse" in sys.argv
 
+# Multi-turn mode:
+#   --followup -> run TWO turns. Because this path is STATELESS chat, the server
+#                 keeps no history, so we replay the whole transcript ourselves in
+#                 the `messages` list (user turns + the system messages we got
+#                 back). Turn 2 is deliberately REFERENTIAL ("that top species"),
+#                 so it can only be answered if the history really was carried.
+FOLLOWUP = "--followup" in sys.argv
+
 # Question (same as the A2A script)
 question = "Which species of tree is most prevalent?"
+# Turn 2 refers back to turn 1 ("that top species"); turn 3 refers back to BOTH
+# ("those trees" = that species + that caretaker) — a multi-hop memory test.
+FOLLOWUP_QUESTIONS = [
+    "For that top species, which caretaker manages the most trees?",
+    "And what is the average DBH of those trees?",
+]
 
 # Verified / example query (same as the A2A script)
 VERIFIED_NLQ = "Which species of tree is most prevalent?"
@@ -220,25 +234,49 @@ try:
     agent_context.data_agent = agent_name
     agent_context.context_version = geminidataanalytics.DataAgentContext.ContextVersion.PUBLISHED
 
-    # We send the request WITHOUT inline source references! The server uses the saved agent config.
-    chat_request = geminidataanalytics.ChatRequest()
-    chat_request.parent = f"projects/{billing_project}/locations/{location}"
-    chat_request.data_agent_context = agent_context
-    chat_request.messages = [geminidataanalytics.Message(
-        user_message=geminidataanalytics.UserMessage(
-            text=question
-        )
-    )]
+    # `history` IS the conversation. The server stores nothing on this path, so
+    # whatever we put in `messages` is the agent's entire memory for the turn.
+    history = []
+
+    def send_turn(text):
+        """Append a user turn, send the WHOLE transcript, and fold the streamed
+        system messages back into the history so the next turn can see them."""
+        history.append(geminidataanalytics.Message(
+            user_message=geminidataanalytics.UserMessage(text=text)
+        ))
+
+        # We send the request WITHOUT inline source references! The server uses the saved agent config.
+        chat_request = geminidataanalytics.ChatRequest()
+        chat_request.parent = f"projects/{billing_project}/locations/{location}"
+        chat_request.data_agent_context = agent_context
+        chat_request.messages = history          # <-- full client-side transcript
+
+        replies = []
+        for response in data_chat_client.chat(request=chat_request):
+            emit(response)
+            replies.append(response.system_message)
+
+        # Carry the agent's replies forward as history for the next turn.
+        for sm in replies:
+            history.append(geminidataanalytics.Message(system_message=sm))
 
     print("Calling chat with persistent agent...")
-    stream = data_chat_client.chat(request=chat_request)
+    send_turn(question)
 
-    for response in stream:
-        emit(response)
+    if FOLLOWUP:
+        # Turns 2 and 3 are REFERENTIAL — resolvable only from the transcript we
+        # replay in `messages` on every call.
+        for i, q in enumerate(FOLLOWUP_QUESTIONS, start=2):
+            print(f"\n--- Turn {i} (history replayed client-side: "
+                  f"{len(history)} messages) ---")
+            print(f"Question: {q}")
+            send_turn(q)
 
     # NOTE: `DataAgentContext` is STATELESS chat against a stateful (published)
-    # agent — the server keeps no history. This needs only
-    # `geminidataanalytics.googleapis.com`; NO `cloudaicompanion` enablement.
+    # agent — the server keeps no history. Multi-turn still works (see
+    # --followup above), but it is YOUR job: replay the transcript in `messages`
+    # on every call. This needs only `geminidataanalytics.googleapis.com`;
+    # NO `cloudaicompanion` enablement.
     # For server-managed multi-turn history, see agent_stateful/main.py
     # (which uses `ConversationReference` and DOES require cloudaicompanion).
 

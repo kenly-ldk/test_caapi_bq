@@ -38,8 +38,20 @@ convo_id = "sf-trees-convo-test"
 #   --parse    -> decode every message kind into a compact, typed summary
 PARSE = "--parse" in sys.argv
 
+# Multi-turn mode:
+#   --followup -> run TWO turns. Unlike the stateless paths, we DO NOT replay any
+#                 history: the server persists it in the `Conversation`, so turn 2
+#                 sends only the new (referential) question.
+FOLLOWUP = "--followup" in sys.argv
+
 # Question (same as the other scripts)
 question = "Which species of tree is most prevalent?"
+# Turn 2 refers back to turn 1 ("that top species"); turn 3 refers back to BOTH
+# ("those trees" = that species + that caretaker) — a multi-hop memory test.
+FOLLOWUP_QUESTIONS = [
+    "For that top species, which caretaker manages the most trees?",
+    "And what is the average DBH of those trees?",
+]
 
 # Verified / example query (same as the other scripts)
 VERIFIED_NLQ = "Which species of tree is most prevalent?"
@@ -262,16 +274,28 @@ try:
     convo_ref.conversation = convo_name
     convo_ref.data_agent_context = agent_context
 
-    chat_request = geminidataanalytics.ChatRequest()
-    chat_request.parent = f"projects/{billing_project}/locations/{location}"
-    chat_request.conversation_reference = convo_ref
-    chat_request.messages = [geminidataanalytics.Message(
-        user_message=geminidataanalytics.UserMessage(text=question)
-    )]
+    def send_turn(text):
+        """Send ONE message. No history is replayed — the server keeps it in the
+        Conversation, which is the whole point of this path."""
+        chat_request = geminidataanalytics.ChatRequest()
+        chat_request.parent = f"projects/{billing_project}/locations/{location}"
+        chat_request.conversation_reference = convo_ref
+        chat_request.messages = [geminidataanalytics.Message(
+            user_message=geminidataanalytics.UserMessage(text=text)
+        )]
+        for response in data_chat_client.chat(request=chat_request):
+            emit(response)
 
     print("Calling chat with ConversationReference...")
-    for response in data_chat_client.chat(request=chat_request):
-        emit(response)
+    send_turn(question)
+
+    if FOLLOWUP:
+        # Turns 2 and 3 are REFERENTIAL and we send NOTHING but the new question —
+        # if they resolve, the SERVER supplied the history from the Conversation.
+        for i, q in enumerate(FOLLOWUP_QUESTIONS, start=2):
+            print(f"\n--- Turn {i} (server-side history; only the new question is sent) ---")
+            print(f"Question: {q}")
+            send_turn(q)
 
 except Exception as e:  # noqa: BLE001
     print(f"Error chatting with persistent conversation: {e}")

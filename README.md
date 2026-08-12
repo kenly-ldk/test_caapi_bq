@@ -50,6 +50,9 @@ python3 connection_approaches/agent_stateful/main.py     # Stateful conversation
 python3 connection_approaches/agent_a2a/main.py          # A2A streaming (verified-query match signal)
 
 python3 connection_approaches/agent_stateless/main.py --parse   # typed summary
+
+# --followup runs a 3-turn conversation (works on all four approaches)
+python3 connection_approaches/agent_stateless/main.py --parse --followup
 ```
 
 See [connection_approaches/README.md](connection_approaches/README.md) for the
