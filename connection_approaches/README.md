@@ -50,11 +50,19 @@ stores the history**, not whether follow-ups are possible.
 Run a **3-turn** conversation on any of them:
 
 ```bash
+# add --parse for the typed summary; omit it for the raw verbatim stream
 python3 connection_approaches/inline_chat/main.py      --parse --followup
 python3 connection_approaches/agent_stateless/main.py  --parse --followup
 python3 connection_approaches/agent_stateful/main.py   --parse --followup
 python3 connection_approaches/agent_a2a/main.py        --parse --followup
 ```
+
+Both forms are captured per folder, mirroring the single-turn convention:
+
+| Capture | Produced by |
+|---|---|
+| `output.verbatim.txt` / `output.parsed.txt` | single turn (`main.py` [`--parse`]) |
+| `output.followup.verbatim.txt` / `output.followup.parsed.txt` | 3-turn run (`main.py --followup` [`--parse`]) |
 
 The turns are deliberately **referential**, so they can only be answered if
 history really carried:
@@ -111,7 +119,8 @@ contextId = projects/<project>/locations/global/conversations/01b8c2df-6fac-…
 
 ### Proof that history actually carried
 
-Captured in each folder's `output.followup.txt`. The decisive signal is the
+Captured in each folder as `output.followup.verbatim.txt` (raw stream) and
+`output.followup.parsed.txt` (typed summary). The decisive signal is the
 **generated SQL on turn 2**, which filters on a species string that appears
 nowhere in the question — it could only come from turn 1's result:
 

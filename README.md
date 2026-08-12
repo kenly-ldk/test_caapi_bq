@@ -65,10 +65,12 @@ per-approach walkthrough, and
 ```
 connection_approaches/     # the 4 ways to invoke a CA agent (see its README)
   README.md
-  inline_chat/     ├─ main.py, output.verbatim.txt, output.parsed.txt
-  agent_stateless/ ├─ main.py, output.verbatim.txt, output.parsed.txt
-  agent_stateful/  ├─ main.py, output.verbatim.txt, output.parsed.txt
-  agent_a2a/       └─ main.py, output.verbatim.txt, output.parsed.txt
+  inline_chat/     ├─ main.py + captured runs*
+  agent_stateless/ ├─ main.py + captured runs*
+  agent_stateful/  ├─ main.py + captured runs*
+  agent_a2a/       └─ main.py + captured runs*
+     * each folder holds four captures: output.{verbatim,parsed}.txt (single turn)
+       and output.followup.{verbatim,parsed}.txt (3-turn --followup run)
 permissions-identity/      # IAM / identity model (see its README)
   README.md
   cloud_run_demo/          # deployable demo of the Cloud Run identity models
